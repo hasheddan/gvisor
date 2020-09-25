@@ -273,6 +273,15 @@ func (n *NIC) WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumb
 	return n.writePacket(r, gso, protocol, pkt)
 }
 
+// WritePacketToRemote implements NetworkInterface.
+func (n *NIC) WritePacketToRemote(remoteLinkAddr tcpip.LinkAddress, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
+	r := Route{
+		NetProto:          protocol,
+		RemoteLinkAddress: remoteLinkAddr,
+	}
+	return n.writePacket(&r, gso, protocol, pkt)
+}
+
 func (n *NIC) writePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
 	// WritePacket takes ownership of pkt, calculate numBytes first.
 	numBytes := pkt.Size()
@@ -546,10 +555,10 @@ func (n *NIC) isInGroup(addr tcpip.Address) bool {
 }
 
 func (n *NIC) handlePacket(protocol tcpip.NetworkProtocolNumber, dst, src tcpip.Address, remotelinkAddr tcpip.LinkAddress, addressEndpoint AssignableAddressEndpoint, pkt *PacketBuffer) {
-	r := makeRoute(protocol, dst, src, n, addressEndpoint, false /* handleLocal */, false /* multicastLoop */)
+	r := makeRoute(protocol, dst, src, n, n, addressEndpoint, false /* handleLocal */, false /* multicastLoop */)
 	defer r.Release()
-	r.RemoteLinkAddress = remotelinkAddr
-	n.getNetworkEndpoint(protocol).HandlePacket(&r, pkt)
+	r.PopulatePacketInfo(pkt)
+	n.getNetworkEndpoint(protocol).HandlePacket(pkt)
 }
 
 // DeliverNetworkPacket finds the appropriate network protocol endpoint and
@@ -585,6 +594,8 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 	if local == "" {
 		local = n.LinkEndpoint.LinkAddress()
 	}
+	pkt.NICID = n.ID()
+	pkt.InterfaceCapabilities = n.LinkEndpoint.Capabilities()
 
 	// Are any packet type sockets listening for this network protocol?
 	packetEPs := n.mu.packetEPs[protocol]
@@ -660,14 +671,13 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		}
 
 		// Found a NIC.
-		n := r.nic
+		n := r.localAddressNIC
 		if addressEndpoint := n.getAddressOrCreateTempInner(protocol, dst, false, NeverPrimaryEndpoint); addressEndpoint != nil {
 			if n.isValidForOutgoing(addressEndpoint) {
-				r.LocalLinkAddress = n.LinkEndpoint.LinkAddress()
-				r.RemoteLinkAddress = remote
+				pkt.NICID = n.ID()
 				r.RemoteAddress = src
-				// TODO(b/123449044): Update the source NIC as well.
-				n.getNetworkEndpoint(protocol).HandlePacket(&r, pkt)
+				pkt.NetworkPacketInfo = r.networkPacketInfo()
+				n.getNetworkEndpoint(protocol).HandlePacket(pkt)
 				addressEndpoint.DecRef()
 				r.Release()
 				return
@@ -725,7 +735,7 @@ func (n *NIC) DeliverOutboundPacket(remote, local tcpip.LinkAddress, protocol tc
 
 // DeliverTransportPacket delivers the packets to the appropriate transport
 // protocol endpoint.
-func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition {
+func (n *NIC) DeliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition {
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
@@ -737,7 +747,7 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	// Raw socket packets are delivered based solely on the transport
 	// protocol number. We do not inspect the payload to ensure it's
 	// validly formed.
-	n.stack.demux.deliverRawPacket(r, protocol, pkt)
+	n.stack.demux.deliverRawPacket(protocol, pkt)
 
 	// TransportHeader is empty only when pkt is an ICMP packet or was reassembled
 	// from fragments.
@@ -766,14 +776,25 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 		return TransportPacketHandled
 	}
 
-	id := TransportEndpointID{dstPort, r.LocalAddress, srcPort, r.RemoteAddress}
-	if n.stack.demux.deliverPacket(r, protocol, pkt, id) {
+	netProto, ok := n.stack.networkProtocols[pkt.NetworkProtocolNumber]
+	if !ok {
+		panic(fmt.Sprintf("expected network protocol = %d", pkt.NetworkProtocolNumber))
+	}
+
+	src, dst := netProto.ParseAddresses(pkt.NetworkHeader().View())
+	id := TransportEndpointID{
+		LocalPort:     dstPort,
+		LocalAddress:  dst,
+		RemotePort:    srcPort,
+		RemoteAddress: src,
+	}
+	if n.stack.demux.deliverPacket(protocol, pkt, id) {
 		return TransportPacketHandled
 	}
 
 	// Try to deliver to per-stack default handler.
 	if state.defaultHandler != nil {
-		if state.defaultHandler(r, id, pkt) {
+		if state.defaultHandler(id, pkt) {
 			return TransportPacketHandled
 		}
 	}
@@ -781,7 +802,7 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	// We could not find an appropriate destination for this packet so
 	// give the protocol specific error handler a chance to handle it.
 	// If it doesn't handle it then we should do so.
-	switch res := transProto.HandleUnknownDestinationPacket(r, id, pkt); res {
+	switch res := transProto.HandleUnknownDestinationPacket(id, pkt); res {
 	case UnknownDestinationPacketMalformed:
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return TransportPacketHandled

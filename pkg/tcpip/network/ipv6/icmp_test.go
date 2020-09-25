@@ -86,7 +86,7 @@ type stubDispatcher struct {
 	stack.TransportDispatcher
 }
 
-func (*stubDispatcher) DeliverTransportPacket(*stack.Route, tcpip.TransportProtocolNumber, *stack.PacketBuffer) stack.TransportPacketDisposition {
+func (*stubDispatcher) DeliverTransportPacket(tcpip.TransportProtocolNumber, *stack.PacketBuffer) stack.TransportPacketDisposition {
 	return stack.TransportPacketHandled
 }
 
@@ -145,6 +145,10 @@ func (*testInterface) Name() string {
 
 func (*testInterface) Enabled() bool {
 	return true
+}
+
+func (*testInterface) WritePacketToRemote(tcpip.LinkAddress, *stack.GSO, tcpip.NetworkProtocolNumber, *stack.PacketBuffer) *tcpip.Error {
+	return tcpip.ErrNotSupported
 }
 
 func TestICMPCounts(t *testing.T) {
@@ -277,7 +281,8 @@ func TestICMPCounts(t *testing.T) {
 					SrcAddr:       r.LocalAddress,
 					DstAddr:       r.RemoteAddress,
 				})
-				ep.HandlePacket(&r, pkt)
+				r.PopulatePacketInfo(pkt)
+				ep.HandlePacket(pkt)
 			}
 
 			for _, typ := range types {
@@ -419,7 +424,8 @@ func TestICMPCountsWithNeighborCache(t *testing.T) {
 			SrcAddr:       r.LocalAddress,
 			DstAddr:       r.RemoteAddress,
 		})
-		ep.HandlePacket(&r, pkt)
+		r.PopulatePacketInfo(pkt)
+		ep.HandlePacket(pkt)
 	}
 
 	for _, typ := range types {
@@ -1728,7 +1734,8 @@ func TestCallsToNeighborCache(t *testing.T) {
 				SrcAddr:       r.RemoteAddress,
 				DstAddr:       r.LocalAddress,
 			})
-			ep.HandlePacket(&r, pkt)
+			r.PopulatePacketInfo(pkt)
+			ep.HandlePacket(pkt)
 
 			// Confirm the endpoint calls the correct NUDHandler method.
 			if nudHandler.probeCount != test.wantProbeCount {

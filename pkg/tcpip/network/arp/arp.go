@@ -18,6 +18,7 @@
 package arp
 
 import (
+	"fmt"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -121,7 +122,7 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 	return tcpip.ErrNotSupported
 }
 
-func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
+func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 	if !e.isEnabled() {
 		return
 	}
@@ -144,7 +145,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			linkAddr := tcpip.LinkAddress(h.HardwareAddressSender())
 			e.linkAddrCache.AddLinkAddress(e.nic.ID(), addr, linkAddr)
 		} else {
-			if r.Stack().CheckLocalAddress(e.nic.ID(), header.IPv4ProtocolNumber, localAddr) == 0 {
+			if e.protocol.stack.CheckLocalAddress(e.nic.ID(), header.IPv4ProtocolNumber, localAddr) == 0 {
 				return // we have no useful answer, ignore the request
 			}
 
@@ -153,25 +154,33 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			e.nud.HandleProbe(remoteAddr, localAddr, ProtocolNumber, remoteLinkAddr, e.protocol)
 		}
 
-		// As per RFC 826, under Packet Reception:
-		//   Swap hardware and protocol fields, putting the local hardware and
-		//   protocol addresses in the sender fields.
-		//
-		//   Send the packet to the (new) target hardware address on the same
-		//   hardware on which the request was received.
-		origSender := h.HardwareAddressSender()
-		r.RemoteLinkAddress = tcpip.LinkAddress(origSender)
 		respPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			ReserveHeaderBytes: int(e.nic.MaxHeaderLength()) + header.ARPSize,
 		})
 		packet := header.ARP(respPkt.NetworkHeader().Push(header.ARPSize))
 		packet.SetIPv4OverEthernet()
 		packet.SetOp(header.ARPReply)
-		copy(packet.HardwareAddressSender(), r.LocalLinkAddress[:])
-		copy(packet.ProtocolAddressSender(), h.ProtocolAddressTarget())
-		copy(packet.HardwareAddressTarget(), origSender)
-		copy(packet.ProtocolAddressTarget(), h.ProtocolAddressSender())
-		_ = e.nic.WritePacket(r, nil /* gso */, ProtocolNumber, respPkt)
+		if n := copy(packet.HardwareAddressSender(), e.nic.LinkAddress()); n != header.EthernetAddressSize {
+			panic(fmt.Sprintf("copied %d bytes, expected %d bytes", n, header.EthernetAddressSize))
+		}
+		if n := copy(packet.ProtocolAddressSender(), h.ProtocolAddressTarget()); n != header.IPv4AddressSize {
+			panic(fmt.Sprintf("copied %d bytes, expected %d bytes", n, header.IPv4AddressSize))
+		}
+		origSender := h.HardwareAddressSender()
+		if n := copy(packet.HardwareAddressTarget(), origSender); n != header.EthernetAddressSize {
+			panic(fmt.Sprintf("copied %d bytes, expected %d bytes", n, header.EthernetAddressSize))
+		}
+		if n := copy(packet.ProtocolAddressTarget(), h.ProtocolAddressSender()); n != header.IPv4AddressSize {
+			panic(fmt.Sprintf("copied %d bytes, expected %d bytes", n, header.IPv4AddressSize))
+		}
+
+		// As per RFC 826, under Packet Reception:
+		//   Swap hardware and protocol fields, putting the local hardware and
+		//   protocol addresses in the sender fields.
+		//
+		//   Send the packet to the (new) target hardware address on the same
+		//   hardware on which the request was received.
+		_ = e.nic.WritePacketToRemote(tcpip.LinkAddress(origSender), nil /* gso */, ProtocolNumber, respPkt)
 
 	case header.ARPReply:
 		addr := tcpip.Address(h.ProtocolAddressSender())
@@ -199,6 +208,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 
 // protocol implements stack.NetworkProtocol and stack.LinkAddressResolver.
 type protocol struct {
+	stack *stack.Stack
 }
 
 func (p *protocol) Number() tcpip.NetworkProtocolNumber { return ProtocolNumber }
@@ -286,6 +296,6 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNu
 // Note, to make sure that the ARP endpoint receives ARP packets, the "arp"
 // address must be added to every NIC that should respond to ARP requests. See
 // ProtocolAddress for more details.
-func NewProtocol(*stack.Stack) stack.NetworkProtocol {
-	return &protocol{}
+func NewProtocol(s *stack.Stack) stack.NetworkProtocol {
+	return &protocol{stack: s}
 }

@@ -110,8 +110,9 @@ func (t *testObject) checkValues(protocol tcpip.TransportProtocolNumber, vv buff
 // DeliverTransportPacket is called by network endpoints after parsing incoming
 // packets. This is used by the test object to verify that the results of the
 // parsing are expected.
-func (t *testObject) DeliverTransportPacket(r *stack.Route, protocol tcpip.TransportProtocolNumber, pkt *stack.PacketBuffer) stack.TransportPacketDisposition {
-	t.checkValues(protocol, pkt.Data, r.RemoteAddress, r.LocalAddress)
+func (t *testObject) DeliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt *stack.PacketBuffer) stack.TransportPacketDisposition {
+	netHdr := pkt.Network()
+	t.checkValues(protocol, pkt.Data, netHdr.SourceAddress(), netHdr.DestinationAddress())
 	t.dataCalls++
 	return stack.TransportPacketHandled
 }
@@ -302,6 +303,10 @@ func (t *testInterface) setEnabled(v bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.mu.disabled = !v
+}
+
+func (*testInterface) WritePacketToRemote(tcpip.LinkAddress, *stack.GSO, tcpip.NetworkProtocolNumber, *stack.PacketBuffer) *tcpip.Error {
+	return tcpip.ErrNotSupported
 }
 
 func TestSourceAddressValidation(t *testing.T) {
@@ -604,7 +609,8 @@ func TestIPv4Receive(t *testing.T) {
 	if _, _, ok := proto.Parse(pkt); !ok {
 		t.Fatalf("failed to parse packet: %x", pkt.Data.ToView())
 	}
-	ep.HandlePacket(&r, pkt)
+	r.PopulatePacketInfo(pkt)
+	ep.HandlePacket(pkt)
 	if nic.testObject.dataCalls != 1 {
 		t.Fatalf("Bad number of data calls: got %x, want 1", nic.testObject.dataCalls)
 	}
@@ -699,7 +705,9 @@ func TestIPv4ReceiveControl(t *testing.T) {
 			nic.testObject.typ = c.expectedTyp
 			nic.testObject.extra = c.expectedExtra
 
-			ep.HandlePacket(&r, truncatedPacket(view, c.trunc, header.IPv4MinimumSize))
+			pkt := truncatedPacket(view, c.trunc, header.IPv4MinimumSize)
+			r.PopulatePacketInfo(pkt)
+			ep.HandlePacket(pkt)
 			if want := c.expectedCount; nic.testObject.controlCalls != want {
 				t.Fatalf("Bad number of control calls for %q case: got %v, want %v", c.name, nic.testObject.controlCalls, want)
 			}
@@ -777,10 +785,11 @@ func TestIPv4FragmentationReceive(t *testing.T) {
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Data: frag1.ToVectorisedView(),
 	})
+	r.PopulatePacketInfo(pkt)
 	if _, _, ok := proto.Parse(pkt); !ok {
 		t.Fatalf("failed to parse packet: %x", pkt.Data.ToView())
 	}
-	ep.HandlePacket(&r, pkt)
+	ep.HandlePacket(pkt)
 	if nic.testObject.dataCalls != 0 {
 		t.Fatalf("Bad number of data calls: got %x, want 0", nic.testObject.dataCalls)
 	}
@@ -789,10 +798,11 @@ func TestIPv4FragmentationReceive(t *testing.T) {
 	pkt = stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Data: frag2.ToVectorisedView(),
 	})
+	r.PopulatePacketInfo(pkt)
 	if _, _, ok := proto.Parse(pkt); !ok {
 		t.Fatalf("failed to parse packet: %x", pkt.Data.ToView())
 	}
-	ep.HandlePacket(&r, pkt)
+	ep.HandlePacket(pkt)
 	if nic.testObject.dataCalls != 1 {
 		t.Fatalf("Bad number of data calls: got %x, want 1", nic.testObject.dataCalls)
 	}
@@ -889,10 +899,11 @@ func TestIPv6Receive(t *testing.T) {
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Data: view.ToVectorisedView(),
 	})
+	r.PopulatePacketInfo(pkt)
 	if _, _, ok := proto.Parse(pkt); !ok {
 		t.Fatalf("failed to parse packet: %x", pkt.Data.ToView())
 	}
-	ep.HandlePacket(&r, pkt)
+	ep.HandlePacket(pkt)
 	if nic.testObject.dataCalls != 1 {
 		t.Fatalf("Bad number of data calls: got %x, want 1", nic.testObject.dataCalls)
 	}
@@ -1009,7 +1020,9 @@ func TestIPv6ReceiveControl(t *testing.T) {
 			// Set ICMPv6 checksum.
 			icmp.SetChecksum(header.ICMPv6Checksum(icmp, outerSrcAddr, localIPv6Addr, buffer.VectorisedView{}))
 
-			ep.HandlePacket(&r, truncatedPacket(view, c.trunc, header.IPv6MinimumSize))
+			pkt := truncatedPacket(view, c.trunc, header.IPv6MinimumSize)
+			r.PopulatePacketInfo(pkt)
+			ep.HandlePacket(pkt)
 			if want := c.expectedCount; nic.testObject.controlCalls != want {
 				t.Fatalf("Bad number of control calls for %q case: got %v, want %v", c.name, nic.testObject.controlCalls, want)
 			}
