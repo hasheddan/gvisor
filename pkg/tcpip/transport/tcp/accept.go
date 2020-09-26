@@ -228,11 +228,12 @@ func (l *listenContext) createConnectingEndpoint(s *segment, iss seqnum.Value, i
 	return n
 }
 
-// createEndpointAndPerformHandshake creates a new endpoint in connected state
-// and then performs the TCP 3-way handshake.
+// createEndpointAndStartHandshake creates a new endpoint in connecting state
+// and then sends the SYN-ACK for the TCP 3-way handshake. It returns an
+// endpoint in SYN-RCVD state.
 //
-// The new endpoint is returned with e.mu held.
-func (l *listenContext) createEndpointAndPerformHandshake(s *segment, opts *header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner) (*endpoint, *tcpip.Error) {
+// On success, the new endpoint is returned with e.mu held.
+func (l *listenContext) createEndpointAndStartHandshake(s *segment, opts *header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner) (*endpoint, *tcpip.Error) {
 	// Create new endpoint.
 	irs := s.sequenceNumber
 	isn := generateSecureISN(s.id, l.stack.Seed())
@@ -247,7 +248,6 @@ func (l *listenContext) createEndpointAndPerformHandshake(s *segment, opts *head
 	// listenEP is nil when listenContext is used by tcp.Forwarder.
 	deferAccept := time.Duration(0)
 	if l.listenEP != nil {
-		l.listenEP.mu.Lock()
 		if l.listenEP.EndpointState() != StateListen {
 
 			l.listenEP.mu.Unlock()
@@ -277,7 +277,6 @@ func (l *listenContext) createEndpointAndPerformHandshake(s *segment, opts *head
 		}
 
 		deferAccept = l.listenEP.deferAccept
-		l.listenEP.mu.Unlock()
 	}
 
 	// Register new endpoint so that packets are routed to it.
@@ -296,28 +295,39 @@ func (l *listenContext) createEndpointAndPerformHandshake(s *segment, opts *head
 
 	ep.isRegistered = true
 
-	// Perform the 3-way handshake.
-	h := newPassiveHandshake(ep, seqnum.Size(ep.initialReceiveWindow()), isn, irs, opts, deferAccept)
-	if err := h.execute(); err != nil {
-		ep.mu.Unlock()
-		ep.Close()
-		ep.notifyAborted()
-
+	// Initialize and start the handshake.
+	h := ep.newPassiveHandshake(isn, irs, opts, deferAccept)
+	if err := h.start(); err != nil {
+		ep.cleanupFailedHandshake(l)
 		if l.listenEP != nil {
 			l.removePendingEndpoint(ep)
 		}
-
-		ep.drainClosingSegmentQueue()
-
 		return nil, err
 	}
-	ep.isConnectNotified = true
+	return ep, nil
+}
 
-	// Update the receive window scaling. We can't do it before the
-	// handshake because it's possible that the peer doesn't support window
-	// scaling.
-	ep.rcv.rcvWndScale = h.effectiveRcvWndScale()
+// createEndpointAndPerformHandshake creates a new endpoint in connecting state
+// and then performs the TCP 3-way handshake.
+//
+// On success, the new endpoint is returned with e.mu held.
+func (l *listenContext) createEndpointAndPerformHandshake(s *segment, opts *header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner) (*endpoint, *tcpip.Error) {
+	ep, err := l.createEndpointAndStartHandshake(s, opts, queue, owner)
+	if err != nil {
+		return nil, err
+	}
 
+	if l.listenEP != nil {
+		defer l.removePendingEndpoint(ep)
+	}
+
+	if err := ep.h.complete(); err != nil {
+		ep.stack.Stats().TCP.FailedConnectionAttempts.Increment()
+		ep.stats.FailedConnectionAttempts.Increment()
+		ep.cleanupFailedHandshake(l)
+		return nil, err
+	}
+	ep.cleanupCompletedHandshake(l)
 	return ep, nil
 }
 
@@ -342,6 +352,36 @@ func (l *listenContext) closeAllPendingEndpoints() {
 	}
 	l.pendingMu.Unlock()
 	l.pending.Wait()
+}
+
+// Precondition: ep.mu must be held.
+func (ep *endpoint) cleanupFailedHandshake(ctx *listenContext) {
+	ep.mu.Unlock()
+	ep.Close()
+	ep.notifyAborted()
+	if ctx.listenEP != nil {
+		ctx.removePendingEndpoint(ep)
+	}
+	ep.drainClosingSegmentQueue()
+}
+
+// cleanupCompletedHandshake transfers any state from the completed handshake to
+// the endpoint.
+//
+// Precondition: ep.mu must be held.
+func (ep *endpoint) cleanupCompletedHandshake(ctx *listenContext) {
+	if ctx.listenEP != nil {
+		ctx.removePendingEndpoint(ep)
+	}
+	ep.isConnectNotified = true
+
+	// Update the receive window scaling. We can't do it before the
+	// handshake because it's possible that the peer doesn't support window
+	// scaling.
+	ep.rcv.rcvWndScale = ep.h.effectiveRcvWndScale()
+
+	// Clean up handshake state stored in the endpoint so that it can be GCed.
+	ep.h = nil
 }
 
 // deliverAccepted delivers the newly-accepted endpoint to the listener. If the
@@ -424,25 +464,37 @@ func (e *endpoint) notifyAborted() {
 // A limited number of these goroutines are allowed before TCP starts using SYN
 // cookies to accept connections.
 func (e *endpoint) handleSynSegment(ctx *listenContext, s *segment, opts *header.TCPSynOptions) {
-	defer ctx.synRcvdCount.dec()
-	defer func() {
-		e.mu.Lock()
-		e.decSynRcvdCount()
-		e.mu.Unlock()
-	}()
 	defer s.decRef()
 
-	n, err := ctx.createEndpointAndPerformHandshake(s, opts, &waiter.Queue{}, e.owner)
+	n, err := ctx.createEndpointAndStartHandshake(s, opts, &waiter.Queue{}, e.owner)
 	if err != nil {
 		e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
 		e.stats.FailedConnectionAttempts.Increment()
 		return
 	}
-	ctx.removePendingEndpoint(n)
-	n.startAcceptedLoop()
-	e.stack.Stats().TCP.PassiveConnectionOpenings.Increment()
 
-	e.deliverAccepted(n)
+	go func() {
+		defer ctx.synRcvdCount.dec()
+		defer func() {
+			e.mu.Lock()
+			e.decSynRcvdCount()
+			e.mu.Unlock()
+		}()
+		if err := n.h.complete(); err != nil {
+			e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
+			e.stats.FailedConnectionAttempts.Increment()
+			n.cleanupFailedHandshake(ctx)
+			return
+		}
+		n.cleanupCompletedHandshake(ctx)
+		if ctx.listenEP != nil {
+			ctx.removePendingEndpoint(n)
+		}
+
+		n.startAcceptedLoop()
+		e.stack.Stats().TCP.PassiveConnectionOpenings.Increment()
+		e.deliverAccepted(n)
+	}() // S/R-SAFE: synRcvdCount is the barrier.
 }
 
 func (e *endpoint) incSynRcvdCount() bool {
@@ -492,7 +544,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) {
 			//     backlog.
 			if !e.acceptQueueIsFull() && e.incSynRcvdCount() {
 				s.incRef()
-				go e.handleSynSegment(ctx, s, &opts) // S/R-SAFE: synRcvdCount is the barrier.
+				e.handleSynSegment(ctx, s, &opts)
 				return
 			}
 			ctx.synRcvdCount.dec()
