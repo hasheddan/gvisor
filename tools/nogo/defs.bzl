@@ -162,12 +162,18 @@ def _nogo_aspect_impl(target, ctx):
     # All work is done in the shadow properties for go rules. For a proto
     # library, we simply skip the analysis portion but still need to return a
     # valid NogoInfo to reference the generated binary.
-    if ctx.rule.kind in ("go_library", "go_binary", "go_test", "go_tool_library"):
+    if ctx.rule.kind in ("go_library", "go_tool_library"):
         srcs = ctx.rule.files.srcs
         deps = ctx.rule.attr.deps
+        should_perform_escapes = True
+    elif ctx.rule.kind in ("go_binary", "go_test"):
+        srcs = ctx.rule.files.srcs
+        deps = ctx.rule.attr.deps
+        should_perform_escapes = False
     elif ctx.rule.kind in ("go_proto_library", "go_wrap_cc"):
         srcs = []
         deps = ctx.rule.attr.deps
+        should_perform_escapes = False
     else:
         return [NogoInfo()]
 
@@ -274,6 +280,7 @@ def _nogo_aspect_impl(target, ctx):
             "-findings=%s" % findings.path,
             "-facts=%s" % facts.path,
             "-escapes=%s" % escapes.path,
+            "-escapes_enabled=%s" % ("true" if should_perform_escapes else "false"),
         ],
     )
 

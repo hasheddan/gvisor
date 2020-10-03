@@ -493,6 +493,7 @@ var (
 	findingsOutput = flag.String("findings", "", "output file (or stdout, if not specified)")
 	factsOutput    = flag.String("facts", "", "output file for facts (optional)")
 	escapesOutput  = flag.String("escapes", "", "output file for escapes (optional)")
+	escapesEnabled = flag.Bool("escapes_enabled", false, "enable pure escape analysis (requires escapes)")
 )
 
 func loadConfig(file string, config interface{}) interface{} {
@@ -536,17 +537,22 @@ func Main() {
 		findings, factData, err = checkPackage(c, analyzerConfig, nil)
 		// Do we need to do escape analysis?
 		if *escapesOutput != "" {
-			escapes, _, err := checkPackage(c, escapesConfig, nil)
-			if err != nil {
-				log.Fatalf("error performing escape analysis: %v", err)
-			}
 			f, err := os.OpenFile(*escapesOutput, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 			if err != nil {
 				log.Fatalf("unable to open output %q: %v", *escapesOutput, err)
 			}
 			defer f.Close()
-			for _, escape := range escapes {
-				fmt.Fprintf(f, "%s\n", escape)
+			// Note that we may generate the escapes file, but not
+			// actually perform the escape analysis. This is for
+			// simplicity with respect to the starlark plumbing.
+			if *escapesEnabled {
+				escapes, _, err := checkPackage(c, escapesConfig, nil)
+				if err != nil {
+					log.Fatalf("error performing escape analysis: %v", err)
+				}
+				for _, escape := range escapes {
+					fmt.Fprintf(f, "%s\n", escape)
+				}
 			}
 		}
 	} else {
