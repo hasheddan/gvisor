@@ -46,7 +46,7 @@ const (
 	// ProtocolNumber is the ipv6 protocol number.
 	ProtocolNumber = header.IPv6ProtocolNumber
 
-	// maxTotalSize is maximum size that can be encoded in the 16-bit
+	// maxPayloadSize is the maximum size that can be encoded in the 16-bit
 	// PayloadLength field of the ipv6 header.
 	maxPayloadSize = 0xffff
 
@@ -386,8 +386,8 @@ func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params s
 	pkt.NetworkProtocolNumber = ProtocolNumber
 }
 
-func (e *endpoint) packetMustBeFragmented(pkt *stack.PacketBuffer, gso *stack.GSO) bool {
-	return pkt.Size() > int(e.nic.MTU()) && (gso == nil || gso.Type == stack.GSONone)
+func packetMustBeFragmented(pkt *stack.PacketBuffer, mtu uint32, gso *stack.GSO) bool {
+	return (gso == nil || gso.Type == stack.GSONone) && pkt.Size() > int(mtu)
 }
 
 // handleFragments fragments pkt and calls the handler function on each
@@ -416,11 +416,9 @@ func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, mtu uint32, p
 		}
 		n++
 		if !more {
-			break
+			return n, pf.RemainingFragmentCount(), nil
 		}
 	}
-
-	return n, 0, nil
 }
 
 // WritePacket writes a packet to the given destination address and protocol.
@@ -467,8 +465,14 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 		return nil
 	}
 
-	if e.packetMustBeFragmented(pkt, gso) {
-		sent, remain, err := e.handleFragments(r, gso, e.nic.MTU(), pkt, params.Protocol, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
+	mtu := e.nic.MTU()
+	if mtu < header.IPv6MinimumMTU {
+		r.Stats().IP.OutgoingPacketErrors.Increment()
+		return tcpip.ErrInvalidEndpointState
+	}
+
+	if packetMustBeFragmented(pkt, mtu, gso) {
+		sent, remain, err := e.handleFragments(r, gso, mtu, pkt, params.Protocol, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
 			// TODO(gvisor.dev/issue/3884): Evaluate whether we want to send each
 			// fragment one by one using WritePacket() (current strategy) or if we
 			// want to create a PacketBufferList from the fragments and feed it to
@@ -498,22 +502,27 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		return pkts.Len(), nil
 	}
 
+	mtu := e.nic.MTU()
+	if mtu < header.IPv6MinimumMTU {
+		r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(pkts.Len()))
+		return 0, tcpip.ErrInvalidEndpointState
+	}
+
 	for pb := pkts.Front(); pb != nil; pb = pb.Next() {
 		e.addIPHeader(r, pb, params)
-		if e.packetMustBeFragmented(pb, gso) {
+		if packetMustBeFragmented(pb, mtu, gso) {
 			current := pb
-			_, _, err := e.handleFragments(r, gso, e.nic.MTU(), pb, params.Protocol, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
+			_, _, err := e.handleFragments(r, gso, mtu, pb, params.Protocol, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
 				// Modify the packet list in place with the new fragments.
 				pkts.InsertAfter(current, fragPkt)
-				current = current.Next()
+				current = fragPkt
 				return nil
 			})
 			if err != nil {
 				r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(pkts.Len()))
 				return 0, err
 			}
-			// The fragmented packet can be released. The rest of the packets can be
-			// processed.
+			// Remove the packet that was just fragmented and process the rest.
 			pkts.Remove(pb)
 			pb = current
 		}
@@ -1401,11 +1410,14 @@ func (p *protocol) SetForwarding(v bool) {
 // calculateMTU calculates the network-layer payload MTU based on the link-layer
 // payload mtu.
 func calculateMTU(mtu uint32) uint32 {
-	mtu -= header.IPv6MinimumSize
-	if mtu <= maxPayloadSize {
-		return mtu
+	if mtu < header.IPv6MinimumSize {
+		return 0
 	}
-	return maxPayloadSize
+	mtu -= header.IPv6MinimumSize
+	if mtu > maxPayloadSize {
+		mtu = maxPayloadSize
+	}
+	return mtu
 }
 
 // Options holds options to configure a new protocol.
