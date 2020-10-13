@@ -40,7 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-func newInode(fs *filesystem, hostFD int, fileType linux.FileMode, isTTY bool) (*inode, error) {
+func newInode(fs *filesystem, hostFD int, savable bool, fileType linux.FileMode, isTTY bool) (*inode, error) {
 	// Determine if hostFD is seekable. If not, this syscall will return ESPIPE
 	// (see fs/read_write.c:llseek), e.g. for pipes, sockets, and some character
 	// devices.
@@ -50,6 +50,7 @@ func newInode(fs *filesystem, hostFD int, fileType linux.FileMode, isTTY bool) (
 	i := &inode{
 		hostFD:     hostFD,
 		ino:        fs.NextIno(),
+		savable:    savable,
 		isTTY:      isTTY,
 		wouldBlock: wouldBlock(uint32(fileType)),
 		seekable:   seekable,
@@ -80,6 +81,11 @@ func newInode(fs *filesystem, hostFD int, fileType linux.FileMode, isTTY bool) (
 
 // NewFDOptions contains options to NewFD.
 type NewFDOptions struct {
+	// If Savable is true, the host file descriptor may be saved/restored by
+	// numeric value; the sandbox API requires a corresponding host FD with the
+	// same numeric value to be provieded at time of restore.
+	Savable bool
+
 	// If IsTTY is true, the file descriptor is a TTY.
 	IsTTY bool
 
@@ -114,7 +120,7 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	}
 
 	d := &kernfs.Dentry{}
-	i, err := newInode(fs, hostFD, linux.FileMode(s.Mode).FileType(), opts.IsTTY)
+	i, err := newInode(fs, hostFD, opts.Savable, linux.FileMode(s.Mode).FileType(), opts.IsTTY)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +138,8 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 // ImportFD sets up and returns a vfs.FileDescription from a donated fd.
 func ImportFD(ctx context.Context, mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs.FileDescription, error) {
 	return NewFD(ctx, mnt, hostFD, &NewFDOptions{
-		IsTTY: isTTY,
+		Savable: true,
+		IsTTY:   isTTY,
 	})
 }
 
@@ -215,6 +222,11 @@ type inode struct {
 	//
 	// This field is initialized at creation time and is immutable.
 	ino uint64
+
+	// savable is true if hostFD may be saved/restored by its numeric value.
+	//
+	// This field is initialized at creation time and is immutable.
+	savable bool
 
 	// isTTY is true if this file represents a TTY.
 	//

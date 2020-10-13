@@ -35,17 +35,12 @@ import (
 
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
-	// Snapshot current syncable dentries and special files.
+	// Snapshot current syncable dentries.
 	fs.syncMu.Lock()
 	ds := make([]*dentry, 0, len(fs.syncableDentries))
 	for d := range fs.syncableDentries {
 		d.IncRef()
 		ds = append(ds, d)
-	}
-	sffds := make([]*specialFileFD, 0, len(fs.specialFileFDs))
-	for sffd := range fs.specialFileFDs {
-		sffd.vfsfd.IncRef()
-		sffds = append(sffds, sffd)
 	}
 	fs.syncMu.Unlock()
 
@@ -53,22 +48,18 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 	// regardless.
 	var retErr error
 
-	// Sync regular files.
+	// Sync syncable dentries.
 	for _, d := range ds {
-		err := d.syncCachedFile(ctx)
+		// We are syncing all dentries without any expectation as to which are
+		// syncable, so log but don't return sync errors on dentries that were
+		// never opened writably.
+		err := d.syncCachedFile(ctx, true /* lowSyncExpectations */)
 		d.DecRef(ctx)
-		if err != nil && retErr == nil {
-			retErr = err
-		}
-	}
-
-	// Sync special files, which may be writable but do not use dentry shared
-	// handles (so they won't be synced by the above).
-	for _, sffd := range sffds {
-		err := sffd.Sync(ctx)
-		sffd.vfsfd.DecRef(ctx)
-		if err != nil && retErr == nil {
-			retErr = err
+		if err != nil {
+			ctx.Debugf("gofer.filesystem.Sync: dentry.syncCachedFile failed: %v", err)
+			if retErr == nil {
+				retErr = err
+			}
 		}
 	}
 
@@ -229,7 +220,7 @@ func (fs *filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 		return nil, err
 	}
 	if child != nil {
-		if !file.isNil() && inoFromPath(qid.Path) == child.ino {
+		if !file.isNil() && qid.Path == child.qidPath {
 			// The file at this path hasn't changed. Just update cached metadata.
 			file.close(ctx)
 			child.updateFromP9AttrsLocked(attrMask, &attr)
@@ -1512,7 +1503,6 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 			d.IncRef()
 			return &endpoint{
 				dentry: d,
-				file:   d.file.file,
 				path:   opts.Addr,
 			}, nil
 		}
@@ -1590,8 +1580,4 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 	fs.renameMu.RLock()
 	defer fs.renameMu.RUnlock()
 	return genericPrependPath(vfsroot, vd.Mount(), vd.Dentry().Impl().(*dentry), b)
-}
-
-func (fs *filesystem) nextSyntheticIno() inodeNumber {
-	return inodeNumber(atomic.AddUint64(&fs.syntheticSeq, 1) | syntheticInoMask)
 }

@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// +build go1.13
+// +build !go1.17
+
+// Check reflect.Value layout and flag values when updating Go version.
+
 package state
 
 import (
@@ -19,9 +24,23 @@ import (
 	"unsafe"
 )
 
-// unsafePointerTo is logically equivalent to reflect.Value.Addr, but works on
-// values representing unexported fields. This bypasses visibility, but not
-// type safety.
-func unsafePointerTo(obj reflect.Value) reflect.Value {
-	return reflect.NewAt(obj.Type(), unsafe.Pointer(obj.UnsafeAddr()))
+// rwValue returns a copy of obj that is usable in assignments, even if
+// obj was obtained by the use of unexported struct fields.
+func rwValue(obj reflect.Value) reflect.Value {
+	rwobj := obj
+	rv := (*reflectValue)(unsafe.Pointer(&rwobj))
+	rv.flag &^= reflectFlagRO
+	return rwobj
 }
+
+type reflectValue struct {
+	typ  unsafe.Pointer
+	ptr  unsafe.Pointer
+	flag uintptr
+}
+
+const (
+	reflectFlagStickyRO uintptr = 1 << 5
+	reflectFlagEmbedRO  uintptr = 1 << 6
+	reflectFlagRO               = reflectFlagStickyRO | reflectFlagEmbedRO
+)

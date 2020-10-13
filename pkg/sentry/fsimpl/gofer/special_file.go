@@ -15,7 +15,6 @@
 package gofer
 
 import (
-	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -25,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -40,7 +40,7 @@ type specialFileFD struct {
 	fileDescription
 
 	// handle is used for file I/O. handle is immutable.
-	handle handle `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
+	handle handle `state:"nosave"`
 
 	// isRegularFile is true if this FD represents a regular file which is only
 	// possible when filesystemOptions.regularFilesUseSpecialFileFD is in
@@ -54,7 +54,7 @@ type specialFileFD struct {
 
 	// haveQueue is true if this file description represents a file for which
 	// queue may send I/O readiness events. haveQueue is immutable.
-	haveQueue bool
+	haveQueue bool `state:"nosave"`
 	queue     waiter.Queue
 
 	// If seekable is true, off is the file offset. off is protected by mu.
@@ -87,6 +87,9 @@ func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, locks *vfs.FileLocks,
 		}
 		return nil, err
 	}
+	d.fs.syncMu.Lock()
+	d.fs.specialFileFDs[fd] = struct{}{}
+	d.fs.syncMu.Unlock()
 	return fd, nil
 }
 
