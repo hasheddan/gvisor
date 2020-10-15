@@ -27,6 +27,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "test/util/capability_util.h"
+#include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
@@ -484,6 +485,55 @@ TEST(SemaphoreTest, SemIpcSet) {
   EXPECT_THAT(semctl(sem.get(), 0, IPC_SET, &semid), SyscallSucceeds());
   buf.sem_op = 0;
   ASSERT_THAT(semop(sem.get(), &buf, 1), SyscallFailsWithErrno(EACCES));
+}
+
+TEST(SemaphoreTest, SemCtlIpcStat) {
+  // Construct a key for the set.
+  const TempPath keyfile = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  const key_t key = ftok(keyfile.path().c_str(), 1);
+
+  // Drop CAP_IPC_OWNER which allows us to bypass semaphore permissions.
+  ASSERT_NO_ERRNO(SetCapability(CAP_IPC_OWNER, false));
+  const uid_t uid = getuid();
+  const gid_t gid = getgid();
+
+  AutoSem sem(semget(key, 1, 0600 | IPC_CREAT));
+  ASSERT_THAT(sem.get(), SyscallSucceeds());
+
+  struct semid_ds ds;
+  EXPECT_THAT(semctl(sem.get(), 0, IPC_STAT, &ds), SyscallSucceeds());
+
+  EXPECT_EQ(ds.sem_perm.__key, key);
+  EXPECT_EQ(ds.sem_perm.uid, uid);
+  EXPECT_EQ(ds.sem_perm.gid, gid);
+  EXPECT_EQ(ds.sem_perm.cuid, uid);
+  EXPECT_EQ(ds.sem_perm.cgid, gid);
+  EXPECT_EQ(ds.sem_perm.mode, 0600);
+  // Last semop time is not set on creation.
+  EXPECT_EQ(ds.sem_otime, 0);
+  // EXPECT_EQ(ds.sem_ctime, 1);
+  EXPECT_EQ(ds.sem_nsems, 0);
+
+  // Set semid_ds structure of the set.
+  struct semid_ds semid_to_set = {};
+  semid_to_set.sem_perm.uid = uid;
+  semid_to_set.sem_perm.gid = gid;
+  semid_to_set.sem_perm.mode = 0600;
+  ASSERT_THAT(semctl(sem.get(), 0, IPC_SET, &semid_to_set), SyscallSucceeds());
+  struct sembuf buf = {};
+  buf.sem_op = 1;
+  time_t op_start_time = time(nullptr);
+  ASSERT_THAT(semop(sem.get(), &buf, 1), SyscallSucceeds());
+
+  EXPECT_THAT(semctl(sem.get(), 0, IPC_STAT, &ds), SyscallSucceeds());
+  EXPECT_EQ(ds.sem_perm.__key, key);
+  EXPECT_EQ(ds.sem_perm.uid, uid);
+  EXPECT_EQ(ds.sem_perm.gid, gid);
+  EXPECT_EQ(ds.sem_perm.cuid, uid);
+  EXPECT_EQ(ds.sem_perm.cgid, gid);
+  EXPECT_EQ(ds.sem_perm.mode, 0600);
+  EXPECT_GE(ds.sem_otime, op_start_time);
+  // EXPECT_EQ(ds.sem_ctime, 0);
 }
 
 }  // namespace

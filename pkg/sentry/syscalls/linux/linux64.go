@@ -118,7 +118,7 @@ var AMD64 = &kernel.SyscallTable{
 		63:  syscalls.Supported("uname", Uname),
 		64:  syscalls.Supported("semget", Semget),
 		65:  syscalls.PartiallySupported("semop", Semop, "Option SEM_UNDO not supported.", nil),
-		66:  syscalls.PartiallySupported("semctl", Semctl, "Options IPC_INFO, SEM_INFO, IPC_STAT, SEM_STAT, SEM_STAT_ANY, GETNCNT, GETZCNT not supported.", nil),
+		66:  syscalls.PartiallySupported("semctl", Semctl, "Options IPC_INFO, SEM_INFO, SEM_STAT, SEM_STAT_ANY, GETNCNT, GETZCNT not supported.", nil),
 		67:  syscalls.Supported("shmdt", Shmdt),
 		68:  syscalls.ErrorWithEvent("msgget", syserror.ENOSYS, "", []string{"gvisor.dev/issue/135"}), // TODO(b/29354921)
 		69:  syscalls.ErrorWithEvent("msgsnd", syserror.ENOSYS, "", []string{"gvisor.dev/issue/135"}), // TODO(b/29354921)
