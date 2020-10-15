@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
@@ -233,7 +232,8 @@ func (n *NIC) setPromiscuousMode(enable bool) {
 	n.mu.Unlock()
 }
 
-func (n *NIC) isPromiscuousMode() bool {
+// Promiscuous implements NetworkInterface.
+func (n *NIC) Promiscuous() bool {
 	n.mu.RLock()
 	rv := n.mu.promiscuous
 	n.mu.RUnlock()
@@ -272,6 +272,15 @@ func (n *NIC) WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumb
 	}
 
 	return n.writePacket(r, gso, protocol, pkt)
+}
+
+// WritePacketToRemote implements NetworkInterface.
+func (n *NIC) WritePacketToRemote(remoteLinkAddr tcpip.LinkAddress, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
+	r := Route{
+		NetProto:          protocol,
+		RemoteLinkAddress: remoteLinkAddr,
+	}
+	return n.writePacket(&r, gso, protocol, pkt)
 }
 
 func (n *NIC) writePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
@@ -547,10 +556,10 @@ func (n *NIC) isInGroup(addr tcpip.Address) bool {
 }
 
 func (n *NIC) handlePacket(protocol tcpip.NetworkProtocolNumber, dst, src tcpip.Address, remotelinkAddr tcpip.LinkAddress, addressEndpoint AssignableAddressEndpoint, pkt *PacketBuffer) {
-	r := makeRoute(protocol, dst, src, n, addressEndpoint, false /* handleLocal */, false /* multicastLoop */)
+	r := makeRoute(protocol, dst, src, n, n, addressEndpoint, false /* handleLocal */, false /* multicastLoop */)
 	defer r.Release()
-	r.RemoteLinkAddress = remotelinkAddr
-	n.getNetworkEndpoint(protocol).HandlePacket(&r, pkt)
+	r.PopulatePacketInfo(pkt)
+	n.getNetworkEndpoint(protocol).HandlePacket(pkt)
 }
 
 // DeliverNetworkPacket finds the appropriate network protocol endpoint and
@@ -586,6 +595,8 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 	if local == "" {
 		local = n.LinkEndpoint.LinkAddress()
 	}
+	pkt.NICID = n.ID()
+	pkt.InterfaceCapabilities = n.LinkEndpoint.Capabilities()
 
 	// Are any packet type sockets listening for this network protocol?
 	packetEPs := n.mu.packetEPs[protocol]
@@ -596,10 +607,6 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		p := pkt.Clone()
 		p.PktType = tcpip.PacketHost
 		ep.HandlePacket(n.id, local, protocol, p)
-	}
-
-	if netProto.Number() == header.IPv4ProtocolNumber || netProto.Number() == header.IPv6ProtocolNumber {
-		n.stack.stats.IP.PacketsReceived.Increment()
 	}
 
 	// Parse headers.
@@ -617,7 +624,7 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		}
 	}
 
-	src, dst := netProto.ParseAddresses(pkt.NetworkHeader().View())
+	src, _ := netProto.ParseAddresses(pkt.NetworkHeader().View())
 
 	if n.stack.handleLocal && !n.IsLoopback() {
 		if r := n.getAddress(protocol, src); r != nil {
@@ -632,76 +639,12 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		}
 	}
 
-	// Loopback traffic skips the prerouting chain.
-	if !n.IsLoopback() {
-		// iptables filtering.
-		ipt := n.stack.IPTables()
-		address := n.primaryAddress(protocol)
-		if ok := ipt.Check(Prerouting, pkt, nil, nil, address.Address, ""); !ok {
-			// iptables is telling us to drop the packet.
-			n.stack.stats.IP.IPTablesPreroutingDropped.Increment()
-			return
-		}
+	networkEndpoint, ok := n.networkEndpoints[protocol]
+	if !ok {
+		panic(fmt.Sprintf("expected to have network endpoint for protocol = %d for NIC ID = %d", protocol, n.ID()))
 	}
 
-	if addressEndpoint := n.getAddress(protocol, dst); addressEndpoint != nil {
-		n.handlePacket(protocol, dst, src, remote, addressEndpoint, pkt)
-		return
-	}
-
-	// This NIC doesn't care about the packet. Find a NIC that cares about the
-	// packet and forward it to the NIC.
-	//
-	// TODO: Should we be forwarding the packet even if promiscuous?
-	if n.stack.Forwarding(protocol) {
-		r, err := n.stack.FindRoute(0, "", dst, protocol, false /* multicastLoop */)
-		if err != nil {
-			n.stack.stats.IP.InvalidDestinationAddressesReceived.Increment()
-			return
-		}
-
-		// Found a NIC.
-		n := r.nic
-		if addressEndpoint := n.getAddressOrCreateTempInner(protocol, dst, false, NeverPrimaryEndpoint); addressEndpoint != nil {
-			if n.isValidForOutgoing(addressEndpoint) {
-				r.LocalLinkAddress = n.LinkEndpoint.LinkAddress()
-				r.RemoteLinkAddress = remote
-				r.RemoteAddress = src
-				// TODO(b/123449044): Update the source NIC as well.
-				n.getNetworkEndpoint(protocol).HandlePacket(&r, pkt)
-				addressEndpoint.DecRef()
-				r.Release()
-				return
-			}
-
-			addressEndpoint.DecRef()
-		}
-
-		// n doesn't have a destination endpoint.
-		// Send the packet out of n.
-		// TODO(gvisor.dev/issue/1085): According to the RFC, we must decrease the TTL field for ipv4/ipv6.
-
-		// pkt may have set its header and may not have enough headroom for
-		// link-layer header for the other link to prepend. Here we create a new
-		// packet to forward.
-		fwdPkt := NewPacketBuffer(PacketBufferOptions{
-			ReserveHeaderBytes: int(n.LinkEndpoint.MaxHeaderLength()),
-			Data:               buffer.NewVectorisedView(pkt.Size(), pkt.Views()),
-		})
-
-		// TODO(b/143425874) Decrease the TTL field in forwarded packets.
-		if err := n.WritePacket(&r, nil, protocol, fwdPkt); err != nil {
-			n.stack.stats.IP.InvalidDestinationAddressesReceived.Increment()
-		}
-
-		r.Release()
-		return
-	}
-
-	// If a packet socket handled the packet, don't treat it as invalid.
-	if len(packetEPs) == 0 {
-		n.stack.stats.IP.InvalidDestinationAddressesReceived.Increment()
-	}
+	networkEndpoint.HandlePacket(pkt)
 }
 
 // DeliverOutboundPacket implements NetworkDispatcher.DeliverOutboundPacket.
@@ -724,7 +667,7 @@ func (n *NIC) DeliverOutboundPacket(remote, local tcpip.LinkAddress, protocol tc
 
 // DeliverTransportPacket delivers the packets to the appropriate transport
 // protocol endpoint.
-func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition {
+func (n *NIC) DeliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition {
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
@@ -736,7 +679,7 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	// Raw socket packets are delivered based solely on the transport
 	// protocol number. We do not inspect the payload to ensure it's
 	// validly formed.
-	n.stack.demux.deliverRawPacket(r, protocol, pkt)
+	n.stack.demux.deliverRawPacket(protocol, pkt)
 
 	// TransportHeader is empty only when pkt is an ICMP packet or was reassembled
 	// from fragments.
@@ -765,14 +708,25 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 		return TransportPacketHandled
 	}
 
-	id := TransportEndpointID{dstPort, r.LocalAddress, srcPort, r.RemoteAddress}
-	if n.stack.demux.deliverPacket(r, protocol, pkt, id) {
+	netProto, ok := n.stack.networkProtocols[pkt.NetworkProtocolNumber]
+	if !ok {
+		panic(fmt.Sprintf("expected network protocol = %d", pkt.NetworkProtocolNumber))
+	}
+
+	src, dst := netProto.ParseAddresses(pkt.NetworkHeader().View())
+	id := TransportEndpointID{
+		LocalPort:     dstPort,
+		LocalAddress:  dst,
+		RemotePort:    srcPort,
+		RemoteAddress: src,
+	}
+	if n.stack.demux.deliverPacket(protocol, pkt, id) {
 		return TransportPacketHandled
 	}
 
 	// Try to deliver to per-stack default handler.
 	if state.defaultHandler != nil {
-		if state.defaultHandler(r, id, pkt) {
+		if state.defaultHandler(id, pkt) {
 			return TransportPacketHandled
 		}
 	}
@@ -780,7 +734,7 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	// We could not find an appropriate destination for this packet so
 	// give the protocol specific error handler a chance to handle it.
 	// If it doesn't handle it then we should do so.
-	switch res := transProto.HandleUnknownDestinationPacket(r, id, pkt); res {
+	switch res := transProto.HandleUnknownDestinationPacket(id, pkt); res {
 	case UnknownDestinationPacketMalformed:
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return TransportPacketHandled

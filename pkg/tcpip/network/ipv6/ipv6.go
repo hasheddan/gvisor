@@ -448,19 +448,20 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 		netHeader := header.IPv6(pkt.NetworkHeader().View())
 		if ep, err := e.protocol.stack.FindNetworkEndpoint(ProtocolNumber, netHeader.DestinationAddress()); err == nil {
 			route := r.ReverseRoute(netHeader.SourceAddress(), netHeader.DestinationAddress())
-			ep.HandlePacket(&route, pkt)
+			route.PopulatePacketInfo(pkt)
+			ep.HandlePacket(pkt)
 			return nil
 		}
 	}
 
 	if r.Loop&stack.PacketLoop != 0 {
 		loopedR := r.MakeLoopedRoute()
-
-		e.HandlePacket(&loopedR, stack.NewPacketBuffer(stack.PacketBufferOptions{
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			// The inbound path expects an unparsed packet.
 			Data: buffer.NewVectorisedView(pkt.Size(), pkt.Views()),
-		}))
-
+		})
+		loopedR.PopulatePacketInfo(pkt)
+		e.HandlePacket(pkt)
 		loopedR.Release()
 	}
 	if r.Loop&stack.PacketOut == 0 {
@@ -549,7 +550,9 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 				src := netHeader.SourceAddress()
 				dst := netHeader.DestinationAddress()
 				route := r.ReverseRoute(src, dst)
-				ep.HandlePacket(&route, pkt)
+				pkt := pkt.Clone()
+				route.PopulatePacketInfo(pkt)
+				ep.HandlePacket(pkt)
 				n++
 				continue
 			}
@@ -569,33 +572,127 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 	return n + len(dropped), nil
 }
 
-// WriteHeaderIncludedPacker implements stack.NetworkEndpoint. It is not yet
-// supported by IPv6.
-func (*endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBuffer) *tcpip.Error {
-	// TODO(b/146666412): Support IPv6 header-included packets.
-	return tcpip.ErrNotSupported
+// WriteHeaderIncludedPacker implements stack.NetworkEndpoint.
+func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBuffer) *tcpip.Error {
+	// The packet already has an IP header, but there are a few required checks.
+	h, ok := pkt.Data.PullUp(header.IPv6MinimumSize)
+	if !ok {
+		return tcpip.ErrInvalidOptionValue
+	}
+	ip := header.IPv6(h)
+	if !ip.IsValid(pkt.Data.Size()) {
+		return tcpip.ErrInvalidOptionValue
+	}
+
+	// Always set the payload length.
+	ip.SetPayloadLength(uint16(pkt.Data.Size() - header.IPv6MinimumSize))
+
+	// Set the source address when zero.
+	if ip.SourceAddress() == header.IPv6Any {
+		ip.SetSourceAddress(r.LocalAddress)
+	}
+
+	// Set the destination. If the packet already included a destination, it will
+	// be part of the route anyways.
+	ip.SetDestinationAddress(r.RemoteAddress)
+
+	if r.Loop&stack.PacketLoop != 0 {
+		loopedR := r.MakeLoopedRoute()
+		pkt := pkt.Clone()
+		loopedR.PopulatePacketInfo(pkt)
+		e.HandlePacket(pkt)
+		loopedR.Release()
+	}
+	if r.Loop&stack.PacketOut == 0 {
+		return nil
+	}
+
+	if err := e.nic.WritePacket(r, nil /* gso */, ProtocolNumber, pkt); err != nil {
+		r.Stats().IP.OutgoingPacketErrors.Increment()
+		return err
+	}
+	r.Stats().IP.PacketsSent.Increment()
+	return nil
+}
+
+func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) bool {
+	if !e.protocol.Forwarding() {
+		return false
+	}
+
+	h := header.IPv6(pkt.NetworkHeader().View())
+	dst := h.DestinationAddress()
+
+	// Check if the destination is owned by the stack.
+	networkEndpoint, err := e.protocol.stack.FindNetworkEndpoint(ProtocolNumber, dst)
+	if err == nil {
+		networkEndpoint.HandlePacket(pkt)
+		return true
+	}
+	if err != tcpip.ErrBadAddress {
+		return false
+	}
+
+	r, err := e.protocol.stack.FindRoute(0, "", dst, ProtocolNumber, false /* multicastLoop */)
+	if err != nil {
+		return true
+	}
+	defer r.Release()
+
+	vv := buffer.NewVectorisedView(pkt.Size(), pkt.Views())
+	pkt = stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: int(r.MaxHeaderLength()),
+		Data:               vv.ToView().ToVectorisedView(),
+	})
+	// TODO(b/143425874) Decrease the TTL field in forwarded packets.
+	_ = r.WriteHeaderIncludedPacket(pkt)
+	return true
 }
 
 // HandlePacket is called by the link layer when new ipv6 packets arrive for
 // this endpoint.
-func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
+func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 	if !e.isEnabled() {
 		return
 	}
 
+	stats := e.protocol.stack.Stats()
+	stats.IP.PacketsReceived.Increment()
+	ipt := e.protocol.stack.IPTables()
+
+	// Loopback traffic skips the prerouting chain.
+	if !e.nic.IsLoopback() {
+		if ok := ipt.Check(stack.Prerouting, pkt, nil, nil, e.MainAddress().Address, ""); !ok {
+			// iptables is telling us to drop the packet.
+			stats.IP.IPTablesPreroutingDropped.Increment()
+			return
+		}
+	}
+
 	h := header.IPv6(pkt.NetworkHeader().View())
 	if !h.IsValid(pkt.Data.Size() + pkt.NetworkHeader().View().Size() + pkt.TransportHeader().View().Size()) {
-		r.Stats().IP.MalformedPacketsReceived.Increment()
+		stats.IP.MalformedPacketsReceived.Increment()
 		return
 	}
+	src := h.SourceAddress()
+	dst := h.DestinationAddress()
 
 	// As per RFC 4291 section 2.7:
 	//   Multicast addresses must not be used as source addresses in IPv6
 	//   packets or appear in any Routing header.
-	if header.IsV6MulticastAddress(r.RemoteAddress) {
-		r.Stats().IP.InvalidSourceAddressesReceived.Increment()
+	if header.IsV6MulticastAddress(src) {
+		stats.IP.InvalidSourceAddressesReceived.Increment()
 		return
 	}
+
+	addressEndpoint := e.AcquireAssignedAddress(dst, e.nic.Promiscuous(), stack.CanBePrimaryEndpoint)
+	if addressEndpoint == nil {
+		if !e.forwardPacket(pkt) {
+			stats.IP.InvalidDestinationAddressesReceived.Increment()
+		}
+		return
+	}
+	addressEndpoint.DecRef()
 
 	// vv consists of:
 	// - Any IPv6 header bytes after the first 40 (i.e. extensions).
@@ -609,10 +706,9 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 
 	// iptables filtering. All packets that reach here are intended for
 	// this machine and need not be forwarded.
-	ipt := e.protocol.stack.IPTables()
 	if ok := ipt.Check(stack.Input, pkt, nil, nil, "", ""); !ok {
 		// iptables is telling us to drop the packet.
-		r.Stats().IP.IPTablesInputDropped.Increment()
+		stats.IP.IPTablesInputDropped.Increment()
 		return
 	}
 
@@ -622,7 +718,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		previousHeaderStart := it.HeaderOffset()
 		extHdr, done, err := it.Next()
 		if err != nil {
-			r.Stats().IP.MalformedPacketsReceived.Increment()
+			stats.IP.MalformedPacketsReceived.Increment()
 			return
 		}
 		if done {
@@ -634,7 +730,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			// As per RFC 8200 section 4.1, the Hop By Hop extension header is
 			// restricted to appear immediately after an IPv6 fixed header.
 			if previousHeaderStart != 0 {
-				_ = e.protocol.returnError(r, &icmpReasonParameterProblem{
+				_ = e.protocol.returnError(&icmpReasonParameterProblem{
 					code:    header.ICMPv6UnknownHeader,
 					pointer: previousHeaderStart,
 				}, pkt)
@@ -646,7 +742,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			for {
 				opt, done, err := optsIt.Next()
 				if err != nil {
-					r.Stats().IP.MalformedPacketsReceived.Increment()
+					stats.IP.MalformedPacketsReceived.Increment()
 					return
 				}
 				if done {
@@ -660,7 +756,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 				case header.IPv6OptionUnknownActionDiscard:
 					return
 				case header.IPv6OptionUnknownActionDiscardSendICMPNoMulticastDest:
-					if header.IsV6MulticastAddress(r.LocalAddress) {
+					if header.IsV6MulticastAddress(dst) {
 						return
 					}
 					fallthrough
@@ -673,7 +769,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 					//    ICMP Parameter Problem, Code 2, message to the packet's
 					//    Source Address, pointing to the unrecognized Option Type.
 					//
-					_ = e.protocol.returnError(r, &icmpReasonParameterProblem{
+					_ = e.protocol.returnError(&icmpReasonParameterProblem{
 						code:               header.ICMPv6UnknownOption,
 						pointer:            it.ParseOffset() + optsIt.OptionOffset(),
 						respondToMulticast: true,
@@ -698,7 +794,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			// header, so we just make sure Segments Left is zero before processing
 			// the next extension header.
 			if extHdr.SegmentsLeft() != 0 {
-				_ = e.protocol.returnError(r, &icmpReasonParameterProblem{
+				_ = e.protocol.returnError(&icmpReasonParameterProblem{
 					code:    header.ICMPv6ErroneousHeader,
 					pointer: it.ParseOffset(),
 				}, pkt)
@@ -733,8 +829,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 				for {
 					it, done, err := it.Next()
 					if err != nil {
-						r.Stats().IP.MalformedPacketsReceived.Increment()
-						r.Stats().IP.MalformedFragmentsReceived.Increment()
+						stats.IP.MalformedPacketsReceived.Increment()
+						stats.IP.MalformedFragmentsReceived.Increment()
 						return
 					}
 					if done {
@@ -761,8 +857,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 				switch lastHdr.(type) {
 				case header.IPv6RawPayloadHeader:
 				default:
-					r.Stats().IP.MalformedPacketsReceived.Increment()
-					r.Stats().IP.MalformedFragmentsReceived.Increment()
+					stats.IP.MalformedPacketsReceived.Increment()
+					stats.IP.MalformedFragmentsReceived.Increment()
 					return
 				}
 			}
@@ -770,8 +866,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			fragmentPayloadLen := rawPayload.Buf.Size()
 			if fragmentPayloadLen == 0 {
 				// Drop the packet as it's marked as a fragment but has no payload.
-				r.Stats().IP.MalformedPacketsReceived.Increment()
-				r.Stats().IP.MalformedFragmentsReceived.Increment()
+				stats.IP.MalformedPacketsReceived.Increment()
+				stats.IP.MalformedFragmentsReceived.Increment()
 				return
 			}
 
@@ -781,8 +877,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			// Drop the fragment if the size of the reassembled payload would exceed
 			// the maximum payload size.
 			if int(start)+fragmentPayloadLen > header.IPv6MaximumPayloadSize {
-				r.Stats().IP.MalformedPacketsReceived.Increment()
-				r.Stats().IP.MalformedFragmentsReceived.Increment()
+				stats.IP.MalformedPacketsReceived.Increment()
+				stats.IP.MalformedFragmentsReceived.Increment()
 				return
 			}
 
@@ -792,8 +888,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 				// IPv6 ignores the Protocol field since the ID only needs to be unique
 				// across source-destination pairs, as per RFC 8200 section 4.5.
 				fragmentation.FragmentID{
-					Source:      h.SourceAddress(),
-					Destination: h.DestinationAddress(),
+					Source:      src,
+					Destination: dst,
 					ID:          extHdr.ID(),
 				},
 				start,
@@ -803,8 +899,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 				rawPayload.Buf,
 			)
 			if err != nil {
-				r.Stats().IP.MalformedPacketsReceived.Increment()
-				r.Stats().IP.MalformedFragmentsReceived.Increment()
+				stats.IP.MalformedPacketsReceived.Increment()
+				stats.IP.MalformedFragmentsReceived.Increment()
 				return
 			}
 			pkt.Data = data
@@ -823,7 +919,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			for {
 				opt, done, err := optsIt.Next()
 				if err != nil {
-					r.Stats().IP.MalformedPacketsReceived.Increment()
+					stats.IP.MalformedPacketsReceived.Increment()
 					return
 				}
 				if done {
@@ -837,7 +933,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 				case header.IPv6OptionUnknownActionDiscard:
 					return
 				case header.IPv6OptionUnknownActionDiscardSendICMPNoMulticastDest:
-					if header.IsV6MulticastAddress(r.LocalAddress) {
+					if header.IsV6MulticastAddress(dst) {
 						return
 					}
 					fallthrough
@@ -850,7 +946,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 					//    ICMP Parameter Problem, Code 2, message to the packet's
 					//    Source Address, pointing to the unrecognized Option Type.
 					//
-					_ = e.protocol.returnError(r, &icmpReasonParameterProblem{
+					_ = e.protocol.returnError(&icmpReasonParameterProblem{
 						code:               header.ICMPv6UnknownOption,
 						pointer:            it.ParseOffset() + optsIt.OptionOffset(),
 						respondToMulticast: true,
@@ -873,13 +969,13 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			extHdr.Buf.TrimFront(pkt.TransportHeader().View().Size())
 			pkt.Data = extHdr.Buf
 
-			r.Stats().IP.PacketsDelivered.Increment()
+			stats.IP.PacketsDelivered.Increment()
 			if p := tcpip.TransportProtocolNumber(extHdr.Identifier); p == header.ICMPv6ProtocolNumber {
 				pkt.TransportProtocolNumber = p
-				e.handleICMP(r, pkt, hasFragmentHeader)
+				e.handleICMP(pkt, hasFragmentHeader)
 			} else {
-				r.Stats().IP.PacketsDelivered.Increment()
-				switch res := e.dispatcher.DeliverTransportPacket(r, p, pkt); res {
+				stats.IP.PacketsDelivered.Increment()
+				switch res := e.dispatcher.DeliverTransportPacket(p, pkt); res {
 				case stack.TransportPacketHandled:
 				case stack.TransportPacketDestinationPortUnreachable:
 					// As per RFC 4443 section 3.1:
@@ -887,7 +983,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 					//   message with Code 4 in response to a packet for which the
 					//   transport protocol (e.g., UDP) has no listener, if that transport
 					//   protocol has no alternative means to inform the sender.
-					_ = e.protocol.returnError(r, &icmpReasonPortUnreachable{}, pkt)
+					_ = e.protocol.returnError(&icmpReasonPortUnreachable{}, pkt)
 				case stack.TransportPacketProtocolUnreachable:
 					// As per RFC 8200 section 4. (page 7):
 					//   Extension headers are numbered from IANA IP Protocol Numbers
@@ -908,7 +1004,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 					//
 					// Which when taken together indicate that an unknown protocol should
 					// be treated as an unrecognized next header value.
-					_ = e.protocol.returnError(r, &icmpReasonParameterProblem{
+					_ = e.protocol.returnError(&icmpReasonParameterProblem{
 						code:    header.ICMPv6UnknownHeader,
 						pointer: it.ParseOffset(),
 					}, pkt)
@@ -918,11 +1014,11 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			}
 
 		default:
-			_ = e.protocol.returnError(r, &icmpReasonParameterProblem{
+			_ = e.protocol.returnError(&icmpReasonParameterProblem{
 				code:    header.ICMPv6UnknownHeader,
 				pointer: it.ParseOffset(),
 			}, pkt)
-			r.Stats().UnknownProtocolRcvdPackets.Increment()
+			stats.UnknownProtocolRcvdPackets.Increment()
 			return
 		}
 	}
@@ -1531,6 +1627,7 @@ func buildNextFragment(pf *fragmentation.PacketFragmenter, originalIPHeaders hea
 	originalIPHeadersLength := len(originalIPHeaders)
 	fragmentIPHeadersLength := originalIPHeadersLength + header.IPv6FragmentHeaderSize
 	fragmentIPHeaders := header.IPv6(fragPkt.NetworkHeader().Push(fragmentIPHeadersLength))
+	fragPkt.NetworkProtocolNumber = ProtocolNumber
 
 	// Copy the IPv6 header and any extension headers already populated.
 	if copied := copy(fragmentIPHeaders, originalIPHeaders); copied != originalIPHeadersLength {

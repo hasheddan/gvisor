@@ -197,7 +197,6 @@ func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, mtu uint
 	networkHeader := header.IPv4(pkt.NetworkHeader().View())
 	fragMTU := int(calculateFragmentInnerMTU(mtu, pkt))
 	pf := fragmentation.MakePacketFragmenter(pkt, fragMTU, pkt.AvailableHeaderBytes()+len(networkHeader))
-
 	for {
 		fragPkt, more := buildNextFragment(&pf, networkHeader)
 		if err := e.nic.WritePacket(r, gso, ProtocolNumber, fragPkt); err != nil {
@@ -260,14 +259,17 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 		ep, err := e.protocol.stack.FindNetworkEndpoint(ProtocolNumber, netHeader.DestinationAddress())
 		if err == nil {
 			route := r.ReverseRoute(netHeader.SourceAddress(), netHeader.DestinationAddress())
-			ep.HandlePacket(&route, pkt)
+			route.PopulatePacketInfo(pkt)
+			ep.HandlePacket(pkt)
 			return nil
 		}
 	}
 
 	if r.Loop&stack.PacketLoop != 0 {
 		loopedR := r.MakeLoopedRoute()
-		e.HandlePacket(&loopedR, pkt)
+		pkt := pkt.Clone()
+		loopedR.PopulatePacketInfo(pkt)
+		e.HandlePacket(pkt)
 		loopedR.Release()
 	}
 	if r.Loop&stack.PacketOut == 0 {
@@ -293,9 +295,8 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		return pkts.Len(), nil
 	}
 
-	for pkt := pkts.Front(); pkt != nil; {
+	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
 		e.addIPHeader(r, pkt, params)
-		pkt = pkt.Next()
 	}
 
 	nicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
@@ -328,7 +329,9 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 				src := netHeader.SourceAddress()
 				dst := netHeader.DestinationAddress()
 				route := r.ReverseRoute(src, dst)
-				ep.HandlePacket(&route, pkt)
+				pkt := pkt.Clone()
+				route.PopulatePacketInfo(pkt)
+				ep.HandlePacket(pkt)
 				n++
 				continue
 			}
@@ -365,12 +368,12 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 	ip.SetTotalLength(uint16(pkt.Data.Size()))
 
 	// Set the source address when zero.
-	if ip.SourceAddress() == tcpip.Address(([]byte{0, 0, 0, 0})) {
+	if ip.SourceAddress() == header.IPv4Any {
 		ip.SetSourceAddress(r.LocalAddress)
 	}
 
-	// Set the destination. If the packet already included a destination,
-	// it will be part of the route.
+	// Set the destination. If the packet already included a destination, it will
+	// be part of the route anyways.
 	ip.SetDestinationAddress(r.RemoteAddress)
 
 	// Set the packet ID when zero.
@@ -388,7 +391,11 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 	ip.SetChecksum(^ip.CalculateChecksum())
 
 	if r.Loop&stack.PacketLoop != 0 {
-		e.HandlePacket(r, pkt.Clone())
+		loopedR := r.MakeLoopedRoute()
+		pkt := pkt.Clone()
+		loopedR.PopulatePacketInfo(pkt)
+		e.HandlePacket(pkt)
+		loopedR.Release()
 	}
 	if r.Loop&stack.PacketOut == 0 {
 		return nil
@@ -402,34 +409,94 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 	return nil
 }
 
+func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) bool {
+	if !e.protocol.Forwarding() {
+		return false
+	}
+
+	h := header.IPv4(pkt.NetworkHeader().View())
+	dst := h.DestinationAddress()
+
+	// Check if the destination is owned by the stack.
+	networkEndpoint, err := e.protocol.stack.FindNetworkEndpoint(ProtocolNumber, dst)
+	if err == nil {
+		networkEndpoint.HandlePacket(pkt)
+		return true
+	}
+	if err != tcpip.ErrBadAddress {
+		return false
+	}
+
+	r, err := e.protocol.stack.FindRoute(0, "", dst, ProtocolNumber, false /* multicastLoop */)
+	if err != nil {
+		return true
+	}
+	defer r.Release()
+
+	vv := buffer.NewVectorisedView(pkt.Size(), pkt.Views())
+	pkt = stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: int(r.MaxHeaderLength()),
+		Data:               vv.ToView().ToVectorisedView(),
+	})
+	// TODO(b/143425874) Decrease the TTL field in forwarded packets.
+	_ = r.WriteHeaderIncludedPacket(pkt)
+	return true
+}
+
 // HandlePacket is called by the link layer when new ipv4 packets arrive for
 // this endpoint.
-func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
+func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 	if !e.isEnabled() {
 		return
 	}
 
+	stats := e.protocol.stack.Stats()
+	stats.IP.PacketsReceived.Increment()
+	ipt := e.protocol.stack.IPTables()
+
+	// Loopback traffic skips the prerouting chain.
+	if !e.nic.IsLoopback() {
+		if ok := ipt.Check(stack.Prerouting, pkt, nil, nil, e.MainAddress().Address, ""); !ok {
+			// iptables is telling us to drop the packet.
+			stats.IP.IPTablesPreroutingDropped.Increment()
+			return
+		}
+	}
+
 	h := header.IPv4(pkt.NetworkHeader().View())
 	if !h.IsValid(pkt.Data.Size() + pkt.NetworkHeader().View().Size() + pkt.TransportHeader().View().Size()) {
-		r.Stats().IP.MalformedPacketsReceived.Increment()
+		stats.IP.MalformedPacketsReceived.Increment()
 		return
 	}
+	src := h.SourceAddress()
+	dst := h.DestinationAddress()
+
+	addressEndpoint := e.AcquireAssignedAddress(dst, e.nic.Promiscuous(), stack.CanBePrimaryEndpoint)
+	if addressEndpoint == nil {
+		if !e.forwardPacket(pkt) {
+			stats.IP.InvalidDestinationAddressesReceived.Increment()
+		}
+		return
+	}
+	subnet := addressEndpoint.AddressWithPrefix().Subnet()
+	addressEndpoint.DecRef()
 
 	// As per RFC 1122 section 3.2.1.3:
 	//   When a host sends any datagram, the IP source address MUST
 	//   be one of its own IP addresses (but not a broadcast or
 	//   multicast address).
-	if r.IsOutboundBroadcast() || header.IsV4MulticastAddress(r.RemoteAddress) {
-		r.Stats().IP.InvalidSourceAddressesReceived.Increment()
+	if directedBroadcast := subnet.IsBroadcast(src); directedBroadcast || src == header.IPv4Broadcast || header.IsV4MulticastAddress(src) {
+		stats.IP.InvalidSourceAddressesReceived.Increment()
 		return
 	}
 
+	pkt.NetworkPacketInfo.LocalAddressBroadcast = subnet.IsBroadcast(dst) || dst == header.IPv4Broadcast
+
 	// iptables filtering. All packets that reach here are intended for
 	// this machine and will not be forwarded.
-	ipt := e.protocol.stack.IPTables()
 	if ok := ipt.Check(stack.Input, pkt, nil, nil, "", ""); !ok {
 		// iptables is telling us to drop the packet.
-		r.Stats().IP.IPTablesInputDropped.Increment()
+		stats.IP.IPTablesInputDropped.Increment()
 		return
 	}
 
@@ -437,8 +504,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		if pkt.Data.Size()+pkt.TransportHeader().View().Size() == 0 {
 			// Drop the packet as it's marked as a fragment but has
 			// no payload.
-			r.Stats().IP.MalformedPacketsReceived.Increment()
-			r.Stats().IP.MalformedFragmentsReceived.Increment()
+			stats.IP.MalformedPacketsReceived.Increment()
+			stats.IP.MalformedFragmentsReceived.Increment()
 			return
 		}
 		// The packet is a fragment, let's try to reassemble it.
@@ -451,8 +518,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		// size). Otherwise the packet would've been rejected as invalid before
 		// reaching here.
 		if int(start)+pkt.Data.Size() > header.IPv4MaximumPayloadSize {
-			r.Stats().IP.MalformedPacketsReceived.Increment()
-			r.Stats().IP.MalformedFragmentsReceived.Increment()
+			stats.IP.MalformedPacketsReceived.Increment()
+			stats.IP.MalformedFragmentsReceived.Increment()
 			return
 		}
 		var ready bool
@@ -474,8 +541,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			pkt.Data,
 		)
 		if err != nil {
-			r.Stats().IP.MalformedPacketsReceived.Increment()
-			r.Stats().IP.MalformedFragmentsReceived.Increment()
+			stats.IP.MalformedPacketsReceived.Increment()
+			stats.IP.MalformedFragmentsReceived.Increment()
 			return
 		}
 		if !ready {
@@ -483,18 +550,18 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		}
 	}
 
-	r.Stats().IP.PacketsDelivered.Increment()
+	stats.IP.PacketsDelivered.Increment()
 	p := h.TransportProtocol()
 	if p == header.ICMPv4ProtocolNumber {
 		// TODO(gvisor.dev/issues/3810): when we sort out ICMP and transport
 		// headers, the setting of the transport number here should be
 		// unnecessary and removed.
 		pkt.TransportProtocolNumber = p
-		e.handleICMP(r, pkt)
+		e.handleICMP(pkt)
 		return
 	}
 
-	switch res := e.dispatcher.DeliverTransportPacket(r, p, pkt); res {
+	switch res := e.dispatcher.DeliverTransportPacket(p, pkt); res {
 	case stack.TransportPacketHandled:
 	case stack.TransportPacketDestinationPortUnreachable:
 		// As per RFC: 1122 Section 3.2.2.1 A host SHOULD generate Destination
@@ -502,13 +569,13 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		//     3 (Port Unreachable), when the designated transport protocol
 		//     (e.g., UDP) is unable to demultiplex the datagram but has no
 		//     protocol mechanism to inform the sender.
-		_ = e.protocol.returnError(r, &icmpReasonPortUnreachable{}, pkt)
+		_ = e.protocol.returnError(&icmpReasonPortUnreachable{}, pkt)
 	case stack.TransportPacketProtocolUnreachable:
 		// As per RFC: 1122 Section 3.2.2.1
 		//   A host SHOULD generate Destination Unreachable messages with code:
 		//     2 (Protocol Unreachable), when the designated transport protocol
 		//     is not supported
-		_ = e.protocol.returnError(r, &icmpReasonProtoUnreachable{}, pkt)
+		_ = e.protocol.returnError(&icmpReasonProtoUnreachable{}, pkt)
 	default:
 		panic(fmt.Sprintf("unrecognized result from DeliverTransportPacket = %d", res))
 	}
@@ -795,6 +862,7 @@ func buildNextFragment(pf *fragmentation.PacketFragmenter, originalIPHeader head
 
 	originalIPHeaderLength := len(originalIPHeader)
 	nextFragIPHeader := header.IPv4(fragPkt.NetworkHeader().Push(originalIPHeaderLength))
+	fragPkt.NetworkProtocolNumber = ProtocolNumber
 
 	if copied := copy(nextFragIPHeader, originalIPHeader); copied != len(originalIPHeader) {
 		panic(fmt.Sprintf("wrong number of bytes copied into fragmentIPHeaders: got = %d, want = %d", copied, originalIPHeaderLength))
