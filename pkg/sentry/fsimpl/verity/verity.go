@@ -153,10 +153,10 @@ func (FilesystemType) Release(ctx context.Context) {}
 
 // alertIntegrityViolation alerts a violation of integrity, which usually means
 // unexpected modification to the file system is detected. In
-// noCrashOnVerificationFailure mode, it returns an error, otherwise it panic.
-func alertIntegrityViolation(err error, msg string) error {
+// noCrashOnVerificationFailure mode, it returns EIO, otherwise it panic.
+func alertIntegrityViolation(msg string) error {
 	if noCrashOnVerificationFailure {
-		return err
+		return syserror.EIO
 	}
 	panic(msg)
 }
@@ -236,7 +236,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		// the root Merkle file, or it's never generated.
 		fs.vfsfs.DecRef(ctx)
 		d.DecRef(ctx)
-		return nil, nil, alertIntegrityViolation(err, "Failed to find root Merkle file")
+		return nil, nil, alertIntegrityViolation("Failed to find root Merkle file")
 	}
 	d.lowerMerkleVD = lowerMerkleVD
 
@@ -611,7 +611,7 @@ func (fd *fileDescription) enableVerity(ctx context.Context, uio usermem.IO) (ui
 	// or directory other than the root, the parent Merkle tree file should
 	// have also been initialized.
 	if fd.lowerFD == nil || fd.merkleReader == nil || fd.merkleWriter == nil || (fd.parentMerkleWriter == nil && fd.d != fd.d.fs.rootDentry) {
-		return 0, alertIntegrityViolation(syserror.EIO, "Unexpected verity fd: missing expected underlying fds")
+		return 0, alertIntegrityViolation("Unexpected verity fd: missing expected underlying fds")
 	}
 
 	hash, dataSize, err := fd.generateMerkle(ctx)
@@ -657,6 +657,9 @@ func (fd *fileDescription) enableVerity(ctx context.Context, uio usermem.IO) (ui
 // measureVerity returns the hash of fd, saved in verityDigest.
 func (fd *fileDescription) measureVerity(ctx context.Context, uio usermem.IO, verityDigest usermem.Addr) (uintptr, error) {
 	t := kernel.TaskFromContext(ctx)
+	if t == nil {
+		return 0, syserror.EINVAL
+	}
 	var metadata linux.DigestMetadata
 
 	// If allowRuntimeEnable is true, an empty fd.d.hash indicates that
@@ -667,7 +670,7 @@ func (fd *fileDescription) measureVerity(ctx context.Context, uio usermem.IO, ve
 		if fd.d.fs.allowRuntimeEnable {
 			return 0, syserror.ENODATA
 		}
-		return 0, alertIntegrityViolation(syserror.ENODATA, "Ioctl measureVerity: no hash found")
+		return 0, alertIntegrityViolation("Ioctl measureVerity: no hash found")
 	}
 
 	// The first part of VerityDigest is the metadata.
@@ -702,6 +705,9 @@ func (fd *fileDescription) verityFlags(ctx context.Context, uio usermem.IO, flag
 	}
 
 	t := kernel.TaskFromContext(ctx)
+	if t == nil {
+		return 0, syserror.EINVAL
+	}
 	_, err := primitive.CopyInt32Out(t, flags, f)
 	return 0, err
 }
@@ -742,7 +748,7 @@ func (fd *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 	// contains the expected xattrs. If the xattr does not exist, it
 	// indicates unexpected modifications to the file system.
 	if err == syserror.ENODATA {
-		return 0, alertIntegrityViolation(err, fmt.Sprintf("Failed to get xattr %s: %v", merkleSizeXattr, err))
+		return 0, alertIntegrityViolation(fmt.Sprintf("Failed to get xattr %s: %v", merkleSizeXattr, err))
 	}
 	if err != nil {
 		return 0, err
@@ -752,7 +758,7 @@ func (fd *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 	// unexpected modifications to the file system.
 	size, err := strconv.Atoi(dataSize)
 	if err != nil {
-		return 0, alertIntegrityViolation(err, fmt.Sprintf("Failed to convert xattr %s to int: %v", merkleSizeXattr, err))
+		return 0, alertIntegrityViolation(fmt.Sprintf("Failed to convert xattr %s to int: %v", merkleSizeXattr, err))
 	}
 
 	dataReader := vfs.FileReadWriteSeeker{
@@ -780,7 +786,7 @@ func (fd *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 		DataAndTreeInSameFile: false,
 	})
 	if err != nil {
-		return 0, alertIntegrityViolation(syserror.EIO, fmt.Sprintf("Verification failed: %v", err))
+		return 0, alertIntegrityViolation(fmt.Sprintf("Verification failed: %v", err))
 	}
 	return n, err
 }
